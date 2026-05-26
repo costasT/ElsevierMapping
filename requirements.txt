@@ -1,1 +1,3 @@
 pytest
+sentence-transformers  
+faiss-cpu   

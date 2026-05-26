@@ -1,6 +1,9 @@
 import re
 import os
+from difflib import SequenceMatcher
 from typing import Iterable, Union, List, Dict, Callable, Optional
+import pickle
+import pathlib
 
 # --- Expression-based mapping support ---------------------------------
 # Basic grammar supports atoms of the form FIELD1-FIELD2("phrase") or
@@ -8,6 +11,58 @@ from typing import Iterable, Union, List, Dict, Callable, Optional
 # can be TITLE, ABS, KW. Example: ("poverty" OR TITLE-ABS("unesco")) AND KW("social protection")
 
 _pattern_cache: dict = {}
+
+
+def _normalize_similarity_text(value: Optional[str]) -> str:
+    text = (value or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _word_similarity_match(phrase: str, text: str, threshold: float) -> bool:
+    phrase_norm = _normalize_similarity_text(phrase)
+    text_norm = _normalize_similarity_text(text)
+    if not phrase_norm or not text_norm:
+        return False
+
+    phrase_tokens = phrase_norm.split()
+    text_tokens = text_norm.split()
+    if not phrase_tokens or not text_tokens:
+        return False
+
+    target = " ".join(phrase_tokens)
+    window_size = len(phrase_tokens)
+
+    if window_size == 1:
+        return any(
+            SequenceMatcher(None, target, token).ratio() >= threshold
+            for token in text_tokens
+        )
+
+    if len(text_tokens) < window_size:
+        return SequenceMatcher(None, target, text_norm).ratio() >= threshold
+
+    for start in range(len(text_tokens) - window_size + 1):
+        window = " ".join(text_tokens[start : start + window_size])
+        if SequenceMatcher(None, target, window).ratio() >= threshold:
+            return True
+    return False
+
+
+def _call_predicate(
+    pred: Callable,
+    title: Optional[str],
+    abstract: Optional[str],
+    keywords: Optional[Union[str, Iterable[str]]],
+    similarity_threshold: Optional[float] = None,
+) -> bool:
+    if similarity_threshold is None:
+        return bool(pred(title, abstract, keywords))
+
+    try:
+        return bool(pred(title, abstract, keywords, similarity_threshold))
+    except TypeError:
+        return bool(pred(title, abstract, keywords))
 
 
 def _get_pattern(phrase: str) -> re.Pattern:
@@ -58,7 +113,7 @@ def _match_in_field(
 
 
 class _Node:
-    def eval(self, title, abstract, kws):
+    def eval(self, title, abstract, kws, similarity_threshold=None):
         raise NotImplementedError()
 
 
@@ -68,18 +123,40 @@ class _Atom(_Node):
         self.phrase = phrase
         self.fields = fields
 
-    def eval(self, title, abstract, kws):
+    def eval(self, title, abstract, kws, similarity_threshold=None):
         if not self.fields:
             # any field
             pat = _get_pattern(self.phrase)
-            return bool(
+            if bool(
                 pat.search(title or "")
                 or pat.search(abstract or "")
                 or pat.search(kws or "")
+            ):
+                return True
+            if similarity_threshold is None:
+                return False
+            return any(
+                _word_similarity_match(self.phrase, text, similarity_threshold)
+                for text in (title, abstract, kws)
+                if text
             )
         for f in self.fields:
             if _match_in_field(self.phrase, f, title, abstract, kws):
                 return True
+        if similarity_threshold is not None:
+            field_texts = []
+            for f in self.fields:
+                if f == "TITLE":
+                    field_texts.append(title)
+                elif f == "ABS":
+                    field_texts.append(abstract)
+                elif f == "KW":
+                    field_texts.append(kws)
+            return any(
+                _word_similarity_match(self.phrase, text, similarity_threshold)
+                for text in field_texts
+                if text
+            )
         return False
 
 
@@ -88,9 +165,11 @@ class _And(_Node):
         self.left = left
         self.right = right
 
-    def eval(self, title, abstract, kws):
-        return self.left.eval(title, abstract, kws) and self.right.eval(
-            title, abstract, kws
+    def eval(self, title, abstract, kws, similarity_threshold=None):
+        return self.left.eval(
+            title, abstract, kws, similarity_threshold=similarity_threshold
+        ) and self.right.eval(
+            title, abstract, kws, similarity_threshold=similarity_threshold
         )
 
 
@@ -99,9 +178,11 @@ class _Or(_Node):
         self.left = left
         self.right = right
 
-    def eval(self, title, abstract, kws):
-        return self.left.eval(title, abstract, kws) or self.right.eval(
-            title, abstract, kws
+    def eval(self, title, abstract, kws, similarity_threshold=None):
+        return self.left.eval(
+            title, abstract, kws, similarity_threshold=similarity_threshold
+        ) or self.right.eval(
+            title, abstract, kws, similarity_threshold=similarity_threshold
         )
 
 
@@ -109,9 +190,11 @@ class _AndList(_Node):
     def __init__(self, children):
         self.children = children
 
-    def eval(self, title, abstract, kws):
+    def eval(self, title, abstract, kws, similarity_threshold=None):
         for c in self.children:
-            if not c.eval(title, abstract, kws):
+            if not c.eval(
+                title, abstract, kws, similarity_threshold=similarity_threshold
+            ):
                 return False
         return True
 
@@ -120,9 +203,9 @@ class _OrList(_Node):
     def __init__(self, children):
         self.children = children
 
-    def eval(self, title, abstract, kws):
+    def eval(self, title, abstract, kws, similarity_threshold=None):
         for c in self.children:
-            if c.eval(title, abstract, kws):
+            if c.eval(title, abstract, kws, similarity_threshold=similarity_threshold):
                 return True
         return False
 
@@ -131,8 +214,10 @@ class _Not(_Node):
     def __init__(self, child: _Node):
         self.child = child
 
-    def eval(self, title, abstract, kws):
-        return not self.child.eval(title, abstract, kws)
+    def eval(self, title, abstract, kws, similarity_threshold=None):
+        return not self.child.eval(
+            title, abstract, kws, similarity_threshold=similarity_threshold
+        )
 
 
 class _Prox(_Node):
@@ -150,7 +235,7 @@ class _Prox(_Node):
         self.right = right
         self.child = child
 
-    def eval(self, title, abstract, kws):
+    def eval(self, title, abstract, kws, similarity_threshold=None):
         # Field-aware proximity evaluation.
         def field_text(f: str) -> str:
             if f == "TITLE":
@@ -219,18 +304,26 @@ class _Prox(_Node):
                     return True
                 # as a last resort, fall back to logical AND
                 try:
-                    return L.eval(title, abstract, kws) and R.eval(title, abstract, kws)
+                    return L.eval(
+                        title, abstract, kws, similarity_threshold=similarity_threshold
+                    ) and R.eval(
+                        title, abstract, kws, similarity_threshold=similarity_threshold
+                    )
                 except Exception:
                     return False
             # for non-atom children, evaluate child if present
             try:
-                return self.left.eval(title, abstract, kws) and self.right.eval(
-                    title, abstract, kws
+                return self.left.eval(
+                    title, abstract, kws, similarity_threshold=similarity_threshold
+                ) and self.right.eval(
+                    title, abstract, kws, similarity_threshold=similarity_threshold
                 )
             except Exception:
                 return False
         if self.child is not None:
-            return self.child.eval(title, abstract, kws)
+            return self.child.eval(
+                title, abstract, kws, similarity_threshold=similarity_threshold
+            )
         return False
 
 
@@ -575,7 +668,7 @@ def compile_expression(expr: str, return_ast: bool = False):
 
     _iterative_check(root)
 
-    def predicate(title, abstract, keywords):
+    def predicate(title, abstract, keywords, similarity_threshold=None):
         if keywords is None:
             kws = ""
         elif isinstance(keywords, str):
@@ -583,7 +676,12 @@ def compile_expression(expr: str, return_ast: bool = False):
         else:
             kws = " ".join(keywords)
         try:
-            return root.eval(title or "", abstract or "", kws)
+            return root.eval(
+                title or "",
+                abstract or "",
+                kws,
+                similarity_threshold=similarity_threshold,
+            )
         except RecursionError:
             # defensively treat recursion as non-match
             return False
@@ -715,18 +813,96 @@ def tokenize_expression(expr: str):
 # Load and compile all SDG mapping expressions (SDG01..SDG17) from the
 # Provide an object-oriented classifier so mappings are loaded once and
 # multiple classifications can be performed efficiently.
-sdg_dir = os.path.join(os.path.dirname(__file__), "SDG 2023 Queries")
+sdg_dir = os.path.join(os.path.dirname(__file__), "SDG Queries")
 
 
 class SDGClassifier:
-    def __init__(self, sdg_dir_path: Optional[str] = None):
+    """Classifier for Elsevier-style SDG mapping expressions.
+
+    Parameters
+    ----------
+    sdg_dir_path:
+        Directory containing the SDG01.txt .. SDG17.txt mapping files.
+        Defaults to the bundled `SDG Queries/` folder next to this module.
+    embedder:
+        Optional callable that accepts a list of strings and returns a list of
+        vector-like embeddings. Provide this when using `similarity_method='embed'`
+        or `similarity_method='embed_ngram'`.
+    embedding_model_name:
+        Optional sentence-transformers model id. If provided and `embedder` is
+        not set, the classifier will try to load that model lazily.
+    use_faiss:
+        Enable optional FAISS-backed nearest-neighbor search for embedding-based
+        matching. Requires `faiss` / `faiss-cpu` to be installed.
+    cache_dir:
+        Optional path used when persisting the computed phrase index with
+        `save_phrase_index(...)` / `load_phrase_index(...)`. If this is a `.pkl`
+        file path, it is treated as the phrase index file itself; otherwise it is
+        treated as a cache directory.
+    auto_load_cache:
+        If `True`, attempt to load a previously saved phrase index and FAISS
+        indices from `cache_dir` / `cache_faiss_dir` during initialization.
+    auto_save_cache:
+        If `True`, persist the computed phrase index and FAISS indices after
+        they are built.
+    cache_faiss_dir:
+        Optional directory for persisted FAISS index files. Used together with
+        `cache_dir` when saving or loading FAISS indices.
+    """
+
+    def __init__(
+        self,
+        sdg_dir_path: Optional[str] = None,
+        *,
+        embedder: Optional[Callable[[List[str]], List[List[float]]]] = None,
+        embedding_model_name: Optional[str] = None,
+        use_faiss: bool = False,
+        cache_dir: Optional[str] = None,
+        auto_load_cache: bool = False,
+        auto_save_cache: bool = False,
+        cache_faiss_dir: Optional[str] = None,
+    ):
         self.sdg_dir = sdg_dir_path or sdg_dir
         if not os.path.isdir(self.sdg_dir):
             raise RuntimeError(f"SDG queries directory not found: {self.sdg_dir}")
         self.predicates: List[Callable[[str, str, Union[str, Iterable[str]]], bool]] = []
         self.phrases: Dict[int, List[str]] = {}
         self.fallback_sdgs: List[tuple] = []
+        self.embedder = embedder
+        self.embedding_model_name = embedding_model_name
+        self.use_faiss = use_faiss
+        self.auto_save_cache = auto_save_cache
+        # cache directory to save/load persisted artifacts (phrase_index, faiss)
+        self.cache_dir = cache_dir
+        self.cache_faiss_dir = cache_faiss_dir
+        self.phrase_embeddings: Dict[int, List] = {}
+        # optimized index: per-SDG list of (length, phrase, embedding)
+        self.phrase_index: Dict[int, List] = {}
+        # optional FAISS indices: {sdg: {length: faiss_index}}
+        self.faiss_index: Dict[int, Dict[int, object]] = {}
         self._load_mappings()
+
+        # optionally auto-load persisted phrase_index and FAISS indices
+        if auto_load_cache:
+            # determine phrase index file path
+            if cache_dir and isinstance(cache_dir, str) and cache_dir.endswith('.pkl'):
+                phrase_file = cache_dir
+                faiss_dir = cache_faiss_dir or (os.path.dirname(phrase_file) if os.path.dirname(phrase_file) else None)
+            else:
+                base_cache = cache_dir or os.path.join(self.sdg_dir, "cache")
+                phrase_file = os.path.join(base_cache, "phrase_index.pkl")
+                faiss_dir = cache_faiss_dir or os.path.join(base_cache, "faiss")
+            try:
+                if phrase_file and os.path.exists(phrase_file):
+                    self.load_phrase_index(phrase_file)
+            except Exception:
+                # ignore cache load failures and proceed with fresh computation
+                pass
+            try:
+                if faiss_dir and os.path.isdir(faiss_dir):
+                    self.load_faiss_indices(faiss_dir)
+            except Exception:
+                pass
 
     def _load_mappings(self):
         missing = []
@@ -777,21 +953,498 @@ class SDGClassifier:
         if missing:
             raise RuntimeError(f"Missing SDG mapping files for: {missing}")
 
-    def classify(self, title: Optional[str], abstract: Optional[str], keywords: Optional[Union[str, Iterable[str]]]) -> List[int]:
+        # if an embedder was provided or a model name given, compute phrase embeddings
+        if self.embedder or self.embedding_model_name:
+            # lazy-load sentence-transformers if a model name was provided
+            if self.embedding_model_name and not self.embedder:
+                try:
+                    from sentence_transformers import SentenceTransformer
+
+                    model = SentenceTransformer(self.embedding_model_name)
+
+                    def _model_embed(texts: List[str]):
+                        arr = model.encode(texts, convert_to_numpy=False)
+                        return [list(a) for a in arr]
+
+                    self.embedder = _model_embed
+                except Exception:
+                    # failed to load model; disable embedding support
+                    self.embedder = None
+            if self.embedder:
+                for sdg, phs in self.phrases.items():
+                    if phs:
+                        try:
+                            embs = self.embedder(phs)
+                            self.phrase_embeddings[sdg] = embs
+                            # build optimized index for quick length-based access
+                            tuples = []
+                            for p, e in zip(phs, embs):
+                                tuples.append((len(p.split()), p, e))
+                            self.phrase_index[sdg] = tuples
+                        except Exception:
+                            self.phrase_embeddings[sdg] = []
+                            self.phrase_index[sdg] = []
+                # optionally build FAISS indices grouped by phrase length
+                if self.use_faiss:
+                    try:
+                        import faiss
+                        import numpy as _np
+
+                        for sdg, tuples in self.phrase_index.items():
+                            length_groups = {}
+                            for L, p, e in tuples:
+                                length_groups.setdefault(L, []).append(e)
+                            idxs = {}
+                            for L, vecs in length_groups.items():
+                                try:
+                                    arr = _np.asarray(vecs, dtype=_np.float32)
+                                    # normalize for inner-product == cosine similarity
+                                    norms = _np.linalg.norm(arr, axis=1, keepdims=True)
+                                    norms[norms == 0] = 1.0
+                                    arr = arr / norms
+                                    d = arr.shape[1]
+                                    index = faiss.IndexFlatIP(d)
+                                    index.add(arr)
+                                    idxs[L] = index
+                                except Exception:
+                                    idxs[L] = None
+                            self.faiss_index[sdg] = idxs
+                    except Exception:
+                        # If faiss not available, silently skip building indices
+                        self.faiss_index = {}
+
+                if self.auto_save_cache:
+                    self.persist_cache()
+
+        # Persistence helpers for phrase index and FAISS indices
+        def _resolve_cache_paths(self):
+            if self.cache_dir and isinstance(self.cache_dir, str) and self.cache_dir.endswith('.pkl'):
+                phrase_file = self.cache_dir
+                faiss_dir = self.cache_faiss_dir or (os.path.dirname(phrase_file) if os.path.dirname(phrase_file) else None)
+            else:
+                base_cache = self.cache_dir or os.path.join(self.sdg_dir, "cache")
+                phrase_file = os.path.join(base_cache, "phrase_index.pkl")
+                faiss_dir = self.cache_faiss_dir or os.path.join(base_cache, "faiss")
+            return phrase_file, faiss_dir
+
+        def persist_cache(self):
+            """Persist the current phrase index and FAISS indices using the configured cache paths."""
+            phrase_file, faiss_dir = self._resolve_cache_paths()
+            saved_any = False
+            if phrase_file:
+                saved_any = self.save_phrase_index(phrase_file) or saved_any
+            if faiss_dir and self.use_faiss:
+                saved_any = self.save_faiss_indices(faiss_dir) or saved_any
+            return saved_any
+
+        def save_phrase_index(self, path: str):
+            """Save the computed phrase_index (including embeddings) to a pickle file."""
+            p = pathlib.Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(p, "wb") as fh:
+                    pickle.dump({"phrase_index": self.phrase_index, "phrases": self.phrases}, fh, protocol=4)
+                return True
+            except Exception:
+                return False
+
+        def load_phrase_index(self, path: str):
+            """Load a previously saved phrase_index. Does not validate dimensions."""
+            p = pathlib.Path(path)
+            if not p.exists():
+                return False
+            try:
+                with open(p, "rb") as fh:
+                    data = pickle.load(fh)
+                self.phrase_index = data.get("phrase_index", {})
+                self.phrases = data.get("phrases", {})
+                # rebuild phrase_embeddings mapping from phrase_index
+                ph_embs = {}
+                for sdg, tuples in self.phrase_index.items():
+                    ph_embs[sdg] = [t[2] for t in tuples]
+                self.phrase_embeddings = ph_embs
+                return True
+            except Exception:
+                return False
+
+        def save_faiss_indices(self, dirpath: str):
+            """Persist any built FAISS indices to files under `dirpath`.
+
+            Files are written as: `{dirpath}/faiss_sdg{sdg}_len{L}.index`.
+            """
+            try:
+                import faiss
+            except Exception:
+                return False
+            p = pathlib.Path(dirpath)
+            p.mkdir(parents=True, exist_ok=True)
+            try:
+                wrote_any = False
+                for sdg, idx_map in (self.faiss_index or {}).items():
+                    for L, index in idx_map.items():
+                        if index is None:
+                            continue
+                        fname = p / f"faiss_sdg{sdg}_len{L}.index"
+                        try:
+                            faiss.write_index(index, str(fname))
+                            wrote_any = True
+                        except Exception:
+                            # ignore single failures
+                            continue
+                return wrote_any
+            except Exception:
+                return False
+
+        def load_faiss_indices(self, dirpath: str):
+            """Load FAISS indices from `dirpath` if present (reverse of save)."""
+            try:
+                import faiss
+            except Exception:
+                return False
+            p = pathlib.Path(dirpath)
+            if not p.exists():
+                return False
+            loaded = {}
+            for f in p.iterdir():
+                name = f.name
+                m = re.match(r"faiss_sdg(\d+)_len(\d+)\.index$", name)
+                if not m:
+                    continue
+                sdg = int(m.group(1))
+                L = int(m.group(2))
+                try:
+                    idx = faiss.read_index(str(f))
+                except Exception:
+                    idx = None
+                loaded.setdefault(sdg, {})[L] = idx
+            if loaded:
+                self.faiss_index = loaded
+                return True
+            return False
+
+        # Persistence is explicit: call `save_phrase_index` / `save_faiss_indices`
+        # to persist computed embeddings/indices. Automatic writing at init
+        # has been intentionally removed to avoid side-effects on import.
+
+    def _resolve_cache_paths(self):
+        if self.cache_dir and isinstance(self.cache_dir, str) and self.cache_dir.endswith('.pkl'):
+            phrase_file = self.cache_dir
+            faiss_dir = self.cache_faiss_dir or (os.path.dirname(phrase_file) if os.path.dirname(phrase_file) else None)
+        else:
+            base_cache = self.cache_dir or os.path.join(self.sdg_dir, "cache")
+            phrase_file = os.path.join(base_cache, "phrase_index.pkl")
+            faiss_dir = self.cache_faiss_dir or os.path.join(base_cache, "faiss")
+        return phrase_file, faiss_dir
+
+    def persist_cache(self):
+        """Persist the current phrase index and FAISS indices using the configured cache paths."""
+        phrase_file, faiss_dir = self._resolve_cache_paths()
+        saved_any = False
+        if phrase_file:
+            saved_any = self.save_phrase_index(phrase_file) or saved_any
+        if faiss_dir and self.use_faiss:
+            saved_any = self.save_faiss_indices(faiss_dir) or saved_any
+        return saved_any
+
+    def save_phrase_index(self, path: str):
+        """Save the computed phrase_index (including embeddings) to a pickle file."""
+        p = pathlib.Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(p, "wb") as fh:
+                pickle.dump({"phrase_index": self.phrase_index, "phrases": self.phrases}, fh, protocol=4)
+            return True
+        except Exception:
+            return False
+
+    def load_phrase_index(self, path: str):
+        """Load a previously saved phrase_index. Does not validate dimensions."""
+        p = pathlib.Path(path)
+        if not p.exists():
+            return False
+        try:
+            with open(p, "rb") as fh:
+                data = pickle.load(fh)
+            self.phrase_index = data.get("phrase_index", {})
+            self.phrases = data.get("phrases", {})
+            # rebuild phrase_embeddings mapping from phrase_index
+            ph_embs = {}
+            for sdg, tuples in self.phrase_index.items():
+                ph_embs[sdg] = [t[2] for t in tuples]
+            self.phrase_embeddings = ph_embs
+            return True
+        except Exception:
+            return False
+
+    def save_faiss_indices(self, dirpath: str):
+        """Persist any built FAISS indices to files under `dirpath`.
+
+        Files are written as: `{dirpath}/faiss_sdg{sdg}_len{L}.index`.
+        """
+        try:
+            import faiss
+        except Exception:
+            return False
+        p = pathlib.Path(dirpath)
+        p.mkdir(parents=True, exist_ok=True)
+        try:
+            wrote_any = False
+            for sdg, idx_map in (self.faiss_index or {}).items():
+                for L, index in idx_map.items():
+                    if index is None:
+                        continue
+                    fname = p / f"faiss_sdg{sdg}_len{L}.index"
+                    try:
+                        faiss.write_index(index, str(fname))
+                        wrote_any = True
+                    except Exception:
+                        # ignore single failures
+                        continue
+            return wrote_any
+        except Exception:
+            return False
+
+    def load_faiss_indices(self, dirpath: str):
+        """Load FAISS indices from `dirpath` if present (reverse of save)."""
+        try:
+            import faiss
+        except Exception:
+            return False
+        p = pathlib.Path(dirpath)
+        if not p.exists():
+            return False
+        loaded = {}
+        for f in p.iterdir():
+            name = f.name
+            m = re.match(r"faiss_sdg(\d+)_len(\d+)\.index$", name)
+            if not m:
+                continue
+            sdg = int(m.group(1))
+            L = int(m.group(2))
+            try:
+                idx = faiss.read_index(str(f))
+            except Exception:
+                idx = None
+            loaded.setdefault(sdg, {})[L] = idx
+        if loaded:
+            self.faiss_index = loaded
+            return True
+        return False
+
+    def classify(
+        self,
+        title: Optional[str],
+        abstract: Optional[str],
+        keywords: Optional[Union[str, Iterable[str]]],
+        similarity_threshold: Optional[float] = None,
+        similarity_method: Optional[str] = None,
+    ) -> List[int]:
+        """Classify one article against all 17 SDG mappings.
+
+        Parameters
+        ----------
+        title:
+            Article title text. May be `None`.
+        abstract:
+            Article abstract text. May be `None`.
+        keywords:
+            Keyword text. Accepts either a single string or an iterable of
+            keyword strings. May be `None`.
+        similarity_threshold:
+            Float in the range 0.0 to 1.0 used for approximate matching.
+            When provided, exact predicate matches are supplemented with a
+            SequenceMatcher-based word similarity fallback.
+        similarity_method:
+            Controls embedding-based matching after exact matching.
+            Supported values are:
+            - `None` (default): exact matching plus the optional
+              `similarity_threshold` fallback.
+            - `"embed"`: whole-document bi-encoder matching.
+            - `"embed_ngram"`: sliding n-gram bi-encoder matching.
+
+        Returns
+        -------
+        List[int]
+            A 17-element list of 0/1 flags, where position 0 corresponds to
+            SDG1 and position 16 corresponds to SDG17.
+        """
         results: List[int] = []
+
+        # prepare sliding windows for embed_ngram if requested
+        doc_windows_by_len: Dict[int, List[str]] = {}
+        window_embs_cache: Dict[int, List] = {}
+        if (
+            similarity_method == "embed_ngram"
+            and similarity_threshold is not None
+            and self.embedder
+            and isinstance(self.phrase_embeddings, dict)
+        ):
+            try:
+                try:
+                    kws_txt = " ".join(keywords) if isinstance(keywords, (list, tuple)) else (keywords or "")
+                except Exception:
+                    kws_txt = str(keywords) if keywords else ""
+                doc_text = " ".join(filter(None, [title or "", abstract or "", kws_txt]))
+            except Exception:
+                doc_text = ""
+            if doc_text:
+                doc_tokens = doc_text.split()
+                unique_lengths = set()
+                for phs in self.phrases.values():
+                    for p in phs:
+                        unique_lengths.add(len(p.split()))
+                for L in unique_lengths:
+                    if L <= 0:
+                        continue
+                    if len(doc_tokens) < L:
+                        continue
+                    windows = [" ".join(doc_tokens[i : i + L]) for i in range(len(doc_tokens) - L + 1)]
+                    if windows:
+                        doc_windows_by_len[L] = windows
+
         for pred in self.predicates:
             try:
-                hit = bool(pred(title, abstract, keywords))
+                hit = _call_predicate(
+                    pred,
+                    title,
+                    abstract,
+                    keywords,
+                    similarity_threshold=similarity_threshold,
+                )
             except Exception:
                 hit = False
+
+            # embedding-based fallback: whole-document bi-encoder
+            if (
+                not hit
+                and similarity_method == "embed"
+                and similarity_threshold is not None
+                and self.embedder
+                and isinstance(self.phrase_embeddings, dict)
+            ):
+                try:
+                    doc_text = " ".join(filter(None, [title or "", abstract or "", (" ".join(keywords) if isinstance(keywords, (list, tuple)) else (keywords or ""))]))
+                except Exception:
+                    doc_text = " ".join(filter(None, [title or "", abstract or "", str(keywords) if keywords else ""]))
+                if doc_text:
+                    try:
+                        vecs = self.embedder([doc_text])
+                        if vecs:
+                            doc_vec = vecs[0]
+                            try:
+                                import numpy as _np
+
+                                def _cos(a, b):
+                                    a = _np.asarray(a, dtype=float)
+                                    b = _np.asarray(b, dtype=float)
+                                    denom = _np.linalg.norm(a) * _np.linalg.norm(b)
+                                    return float(_np.dot(a, b) / denom) if denom else 0.0
+                            except Exception:
+                                def _cos(a, b):
+                                    sa = sum(x * x for x in a) ** 0.5
+                                    sb = sum(x * x for x in b) ** 0.5
+                                    if sa == 0 or sb == 0:
+                                        return 0.0
+                                    return sum(x * y for x, y in zip(a, b)) / (sa * sb)
+
+                            sdg_index = len(results) + 1
+                            ph_embs = self.phrase_embeddings.get(sdg_index, [])
+                            for pvec in ph_embs:
+                                if _cos(doc_vec, pvec) >= similarity_threshold:
+                                    hit = True
+                                    break
+                    except Exception:
+                        pass
+
+            # sliding n-gram bi-encoder matching (compare phrase embeddings
+            # against window embeddings of matching token-length)
+            if (
+                not hit
+                and similarity_method == "embed_ngram"
+                and similarity_threshold is not None
+                and self.embedder
+                and isinstance(self.phrase_embeddings, dict)
+            ):
+                sdg_index = len(results) + 1
+                phs = self.phrases.get(sdg_index, [])
+                ph_embs = self.phrase_embeddings.get(sdg_index, [])
+                if phs and ph_embs:
+                    try:
+                        import numpy as _np
+
+                        def _cos(a, b):
+                            a = _np.asarray(a, dtype=float)
+                            b = _np.asarray(b, dtype=float)
+                            denom = _np.linalg.norm(a) * _np.linalg.norm(b)
+                            return float(_np.dot(a, b) / denom) if denom else 0.0
+                    except Exception:
+                        def _cos(a, b):
+                            sa = sum(x * x for x in a) ** 0.5
+                            sb = sum(x * x for x in b) ** 0.5
+                            if sa == 0 or sb == 0:
+                                return 0.0
+                            return sum(x * y for x, y in zip(a, b)) / (sa * sb)
+
+                    # use optimized phrase_index if available
+                    tuples = self.phrase_index.get(sdg_index)
+                    if tuples is None:
+                        tuples = list(zip((len(p.split()) for p in phs), phs, ph_embs))
+                    for L, phrase, pvec in tuples:
+                        if L <= 0:
+                            continue
+                        windows = doc_windows_by_len.get(L)
+                        if not windows:
+                            continue
+                        # Try FAISS search if available for this SDG/length
+                        faiss_used = False
+                        try:
+                            sdg_idxs = getattr(self, "faiss_index", {}) or {}
+                            sdg_map = sdg_idxs.get(sdg_index, {})
+                            index = sdg_map.get(L) if sdg_map else None
+                        except Exception:
+                            index = None
+                        if index is not None:
+                            try:
+                                import numpy as _np
+
+                                wembs = window_embs_cache.get(L)
+                                if wembs is None:
+                                    try:
+                                        wembs = self.embedder(windows)
+                                    except Exception:
+                                        wembs = []
+                                    window_embs_cache[L] = wembs
+                                if wembs:
+                                    arr = _np.asarray(wembs, dtype=_np.float32)
+                                    norms = _np.linalg.norm(arr, axis=1, keepdims=True)
+                                    norms[norms == 0] = 1.0
+                                    arr = arr / norms
+                                    D, I = index.search(arr, 1)
+                                    if (D >= float(similarity_threshold)).any():
+                                        hit = True
+                                        faiss_used = True
+                            except Exception:
+                                faiss_used = False
+                        if faiss_used:
+                            break
+
+                        # fallback to brute-force comparison using embedder
+                        if L not in window_embs_cache:
+                            try:
+                                window_embs_cache[L] = self.embedder(windows)
+                            except Exception:
+                                window_embs_cache[L] = []
+                        wembs = window_embs_cache.get(L, [])
+                        for wvec in wembs:
+                            if _cos(pvec, wvec) >= similarity_threshold:
+                                hit = True
+                                break
+                        if hit:
+                            break
+
             results.append(1 if hit else 0)
+
         return results
-
-    def is_sdg1(self, title: Optional[str], abstract: Optional[str], keywords: Optional[Union[str, Iterable[str]]]) -> bool:
-        if not self.predicates:
-            raise RuntimeError("No SDG predicates available")
-        return bool(self.predicates[0](title, abstract, keywords))
-
 
 # instantiate a default classifier for backward compatibility (loaded once)
 DEFAULT_CLASSIFIER = SDGClassifier(sdg_dir)
@@ -805,22 +1458,47 @@ def classify_sdgs(
     title: Optional[str],
     abstract: Optional[str],
     keywords: Optional[Union[str, Iterable[str]]],
+    similarity_threshold: Optional[float] = None,
+    similarity_method: Optional[str] = None,
 ) -> List[int]:
     """Return a 17-element list of 0/1 flags indicating SDG membership.
 
     Position 0 -> SDG1, position 16 -> SDG17.
+
+    If `similarity_threshold` is provided, atoms that do not match exactly are
+    also compared using a word-level similarity fallback. Values should be in
+    the range 0.0 to 1.0.
+
+        `similarity_method` controls the embedding-based fallback mode:
+        - `None` (default): exact expression matching plus optional word-level
+            similarity fallback.
+        - `"embed"`: whole-document bi-encoder matching against phrase embeddings.
+        - `"embed_ngram"`: sliding n-gram bi-encoder matching against token-length
+            windows in the document.
     """
-    results: List[int] = []
-    for pred in SDG_PREDICATES:
-        try:
-            hit = bool(pred(title, abstract, keywords))
-        except Exception:
-            # If a predicate errors at runtime, treat as non-match (but do
-            # not silently swallow compilation-time errors which were raised
-            # during import).
-            hit = False
-        results.append(1 if hit else 0)
-    return results
+    # Forward to the default classifier instance which supports embedding
+    # based methods such as 'embed' and 'embed_ngram'. This keeps
+    # backward-compatibility while exposing the extended API.
+    try:
+        return DEFAULT_CLASSIFIER.classify(
+            title, abstract, keywords, similarity_threshold=similarity_threshold, similarity_method=similarity_method
+        )
+    except Exception:
+        # fall back to predicate-only behavior if something goes wrong
+        results: List[int] = []
+        for pred in SDG_PREDICATES:
+            try:
+                hit = _call_predicate(
+                    pred,
+                    title,
+                    abstract,
+                    keywords,
+                    similarity_threshold=similarity_threshold,
+                )
+            except Exception:
+                hit = False
+            results.append(1 if hit else 0)
+        return results
 
 
 if __name__ == "__main__":
