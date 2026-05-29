@@ -4,6 +4,7 @@ from difflib import SequenceMatcher
 from typing import Iterable, Union, List, Dict, Callable, Optional
 import pickle
 import pathlib
+import json
 
 # --- Expression-based mapping support ---------------------------------
 # Basic grammar supports atoms of the form FIELD1-FIELD2("phrase") or
@@ -110,6 +111,36 @@ def _match_in_field(
         return bool(pat.search(kws or ""))
     # Unknown field -> do not match
     return False
+
+
+def _combined_article_text(
+    title: Optional[str],
+    abstract: Optional[str],
+    keywords: Optional[Union[str, Iterable[str]]],
+) -> str:
+    parts = [title or "", abstract or ""]
+    if keywords is None:
+        pass
+    elif isinstance(keywords, str):
+        parts.append(keywords)
+    else:
+        parts.append(" ".join(str(item) for item in keywords if item))
+    return " ".join(part for part in parts if part).strip()
+
+
+def _phrase_present(text: str, phrase: str) -> bool:
+    pat = _get_pattern(phrase)
+    return bool(pat.search(text or ""))
+
+
+def _phrase_matches_text(
+    phrase: str, text: str, similarity_threshold: Optional[float] = None
+) -> bool:
+    if _phrase_present(text, phrase):
+        return True
+    if similarity_threshold is None:
+        return False
+    return _word_similarity_match(phrase, text, similarity_threshold)
 
 
 class _Node:
@@ -298,6 +329,8 @@ class _Prox(_Node):
                 patL = _get_pattern(L.phrase)
                 patR = _get_pattern(R.phrase)
                 directional = self.op.startswith("PRE")
+
+                
                 if patterns_within_distance(
                     patL, patR, combined, self.n, directional=directional
                 ):
@@ -1236,7 +1269,7 @@ class SDGClassifier:
         title: Optional[str],
         abstract: Optional[str],
         keywords: Optional[Union[str, Iterable[str]]],
-        similarity_threshold: Optional[float] = None,
+        similarity_threshold: Optional[Union[float, Dict[int, float]]] = None,
         similarity_method: Optional[str] = None,
     ) -> List[int]:
         """Classify one article against all 17 SDG mappings.
@@ -1251,9 +1284,11 @@ class SDGClassifier:
             Keyword text. Accepts either a single string or an iterable of
             keyword strings. May be `None`.
         similarity_threshold:
-            Float in the range 0.0 to 1.0 used for approximate matching.
-            When provided, exact predicate matches are supplemented with a
-            SequenceMatcher-based word similarity fallback.
+            Either a float in the range 0.0 to 1.0 used for approximate matching
+            (applied to all SDGs), or a mapping `{sdg_index: float}` to provide
+            a different threshold per SDG. When provided, exact predicate
+            matches are supplemented with a SequenceMatcher-based word
+            similarity fallback using the resolved per-SDG threshold.
         similarity_method:
             Controls embedding-based matching after exact matching.
             Supported values are:
@@ -1303,13 +1338,20 @@ class SDGClassifier:
                         doc_windows_by_len[L] = windows
 
         for pred in self.predicates:
+            sdg_index = len(results) + 1
+            # resolve per-SDG similarity threshold: may be a float or a dict
+            if isinstance(similarity_threshold, dict):
+                sdg_sim = similarity_threshold.get(sdg_index)
+            else:
+                sdg_sim = similarity_threshold
+
             try:
                 hit = _call_predicate(
                     pred,
                     title,
                     abstract,
                     keywords,
-                    similarity_threshold=similarity_threshold,
+                    similarity_threshold=sdg_sim,
                 )
             except Exception:
                 hit = False
@@ -1318,7 +1360,7 @@ class SDGClassifier:
             if (
                 not hit
                 and similarity_method == "embed"
-                and similarity_threshold is not None
+                and sdg_sim is not None
                 and self.embedder
                 and isinstance(self.phrase_embeddings, dict)
             ):
@@ -1347,10 +1389,9 @@ class SDGClassifier:
                                         return 0.0
                                     return sum(x * y for x, y in zip(a, b)) / (sa * sb)
 
-                            sdg_index = len(results) + 1
                             ph_embs = self.phrase_embeddings.get(sdg_index, [])
                             for pvec in ph_embs:
-                                if _cos(doc_vec, pvec) >= similarity_threshold:
+                                if _cos(doc_vec, pvec) >= sdg_sim:
                                     hit = True
                                     break
                     except Exception:
@@ -1361,11 +1402,10 @@ class SDGClassifier:
             if (
                 not hit
                 and similarity_method == "embed_ngram"
-                and similarity_threshold is not None
+                and sdg_sim is not None
                 and self.embedder
                 and isinstance(self.phrase_embeddings, dict)
             ):
-                sdg_index = len(results) + 1
                 phs = self.phrases.get(sdg_index, [])
                 ph_embs = self.phrase_embeddings.get(sdg_index, [])
                 if phs and ph_embs:
@@ -1420,7 +1460,7 @@ class SDGClassifier:
                                     norms[norms == 0] = 1.0
                                     arr = arr / norms
                                     D, I = index.search(arr, 1)
-                                    if (D >= float(similarity_threshold)).any():
+                                    if (D >= float(sdg_sim)).any():
                                         hit = True
                                         faiss_used = True
                             except Exception:
@@ -1436,7 +1476,7 @@ class SDGClassifier:
                                 window_embs_cache[L] = []
                         wembs = window_embs_cache.get(L, [])
                         for wvec in wembs:
-                            if _cos(pvec, wvec) >= similarity_threshold:
+                            if _cos(pvec, wvec) >= sdg_sim:
                                 hit = True
                                 break
                         if hit:
@@ -1445,6 +1485,38 @@ class SDGClassifier:
             results.append(1 if hit else 0)
 
         return results
+
+    def matched_phrases(
+        self,
+        title: Optional[str],
+        abstract: Optional[str],
+        keywords: Optional[Union[str, Iterable[str]]],
+        similarity_threshold: Optional[Union[float, Dict[int, float]]] = None,
+    ) -> Dict[int, List[str]]:
+        """Return matched phrases per SDG for this classifier instance.
+
+        `similarity_threshold` may be a float or a dict mapping SDG index -> float
+        to control per-SDG fuzzy matching behavior.
+        """
+
+        text = _combined_article_text(title, abstract, keywords)
+        out: Dict[int, List[str]] = {}
+        if not text:
+            for i in range(1, 18):
+                out[i] = []
+            return out
+
+        for sdg_index in range(1, 18):
+            if isinstance(similarity_threshold, dict):
+                sdg_sim = similarity_threshold.get(sdg_index)
+            else:
+                sdg_sim = similarity_threshold
+            hits: List[str] = []
+            for phrase in self.phrases.get(sdg_index, []):
+                if _phrase_matches_text(phrase, text, sdg_sim):
+                    hits.append(phrase)
+            out[sdg_index] = hits
+        return out
 
 # instantiate a default classifier for backward compatibility (loaded once)
 DEFAULT_CLASSIFIER = SDGClassifier(sdg_dir)
@@ -1458,7 +1530,7 @@ def classify_sdgs(
     title: Optional[str],
     abstract: Optional[str],
     keywords: Optional[Union[str, Iterable[str]]],
-    similarity_threshold: Optional[float] = None,
+    similarity_threshold: Optional[Union[float, Dict[int, float]]] = None,
     similarity_method: Optional[str] = None,
 ) -> List[int]:
     """Return a 17-element list of 0/1 flags indicating SDG membership.
@@ -1486,19 +1558,41 @@ def classify_sdgs(
     except Exception:
         # fall back to predicate-only behavior if something goes wrong
         results: List[int] = []
-        for pred in SDG_PREDICATES:
+        for i, pred in enumerate(SDG_PREDICATES, start=1):
+            # resolve per-SDG similarity threshold if a mapping provided
+            if isinstance(similarity_threshold, dict):
+                sdg_sim = similarity_threshold.get(i)
+            else:
+                sdg_sim = similarity_threshold
             try:
                 hit = _call_predicate(
                     pred,
                     title,
                     abstract,
                     keywords,
-                    similarity_threshold=similarity_threshold,
+                    similarity_threshold=sdg_sim,
                 )
             except Exception:
                 hit = False
             results.append(1 if hit else 0)
         return results
+
+
+def matched_phrases_per_sdg(
+    title: Optional[str],
+    abstract: Optional[str],
+    keywords: Optional[Union[str, Iterable[str]]],
+    similarity_threshold: Optional[Union[float, Dict[int, float]]] = None,
+) -> Dict[int, List[str]]:
+    """Return matched phrases per SDG using the default classifier instance.
+
+    `similarity_threshold` may be a float or a dict mapping SDG index -> float
+    to control per-SDG fuzzy matching behavior.
+    """
+
+    return DEFAULT_CLASSIFIER.matched_phrases(
+        title, abstract, keywords, similarity_threshold=similarity_threshold
+    )
 
 
 if __name__ == "__main__":
@@ -1538,10 +1632,27 @@ if __name__ == "__main__":
             "and extreme poverty in low income regions."
         )
         sample_keywords = ["poverty", "social protection"]
+        # demo: default classification (no per-SDG similarity thresholds)
         vec = classify_sdgs(sample_title, sample_abstract, sample_keywords)
-        print("SDG vector:", vec)
+        print("SDG vector (default):", vec)
         matched = [i + 1 for i, v in enumerate(vec) if v]
-        print("Matched SDGs:", matched or "(none)")
+        print("Matched SDGs (default):", matched or "(none)")
+
+        # demo: per-SDG similarity threshold map example
+        # provide a dict mapping SDG index -> similarity threshold (0.0-1.0)
+        per_sdg_thresh = {1: 1, 14: 0.92, 17: 0.90}
+        vec2 = classify_sdgs(sample_title, sample_abstract, sample_keywords, similarity_threshold=per_sdg_thresh, similarity_method="embed")
+        print("SDG vector (per-SDG thresholds):", vec2)
+        matched2 = [i + 1 for i, v in enumerate(vec2) if v]
+        print("Matched SDGs (per-SDG thresholds):", matched2 or "(none)")
+        # demo: matched phrases per SDG for debugging
+        print('\nMatched phrases (default):')
+        mp_def = matched_phrases_per_sdg(sample_title, sample_abstract, sample_keywords)
+        print(json.dumps({k: v for k, v in mp_def.items() if v}, indent=2, ensure_ascii=False))
+
+        print('\nMatched phrases (per-SDG thresholds):')
+        mp_per = matched_phrases_per_sdg(sample_title, sample_abstract, sample_keywords, similarity_threshold=per_sdg_thresh)
+        print(json.dumps({k: v for k, v in mp_per.items() if v}, indent=2, ensure_ascii=False))
         sys.exit(0)
 
     if args.check_fallbacks:
