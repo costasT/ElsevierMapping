@@ -1,7 +1,7 @@
 import re
 import os
 from difflib import SequenceMatcher
-from typing import Iterable, Union, List, Dict, Callable, Optional
+from typing import Iterable, Union, List, Dict, Callable, Optional, Any
 import pickle
 import pathlib
 import json
@@ -12,6 +12,32 @@ import json
 # can be TITLE, ABS, KW. Example: ("poverty" OR TITLE-ABS("unesco")) AND KW("social protection")
 
 _pattern_cache: dict = {}
+
+_FIELD_LIST_PATTERN = re.compile(
+    r"\s*((?:TITLE|ABS|KW|AUTHKEY|KEY)(?:-(?:TITLE|ABS|KW|AUTHKEY|KEY))*)\s*\(",
+    flags=re.IGNORECASE,
+)
+_SINGLE_QUOTED_LITERAL_PATTERN = re.compile(
+    r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\''
+)
+
+
+def _normalize_fields(fields_raw: str) -> List[str]:
+    """Normalize parsed field specifiers to internal field names."""
+    fields = []
+    for f in fields_raw.upper().split("-"):
+        if f in ("AUTHKEY", "KEY"):
+            fields.append("KW")
+        else:
+            fields.append(f)
+    return fields
+
+
+def _unwrap_single_quoted_literal(text: str) -> str:
+    """Strip wrapping quotes only when text is a single quoted literal."""
+    if _SINGLE_QUOTED_LITERAL_PATTERN.fullmatch(text):
+        return text[1:-1]
+    return text
 
 
 def _normalize_similarity_text(value: Optional[str]) -> str:
@@ -84,8 +110,9 @@ def _get_pattern(phrase: str) -> re.Pattern:
             s = re.escape(s)
             # turn escaped spaces into \s+ to be flexible about whitespace
             s = s.replace(r"\ ", r"\s+")
-            # restore wildcard regex
-            s = s.replace(placeholder, ".*")
+            # restore wildcard regex but restrict it so it doesn't span
+            # across whitespace (i.e. '*' matches within a token only)
+            s = s.replace(placeholder, r"[^\s]*")
             # anchor to word boundaries where practical
             return r"\b" + s + r"\b"
 
@@ -126,6 +153,53 @@ def _combined_article_text(
     else:
         parts.append(" ".join(str(item) for item in keywords if item))
     return " ".join(part for part in parts if part).strip()
+
+
+def _keywords_to_text(keywords: Optional[Union[str, Iterable[str]]]) -> str:
+    """Return keyword payload as a single text string."""
+    if keywords is None:
+        return ""
+    if isinstance(keywords, str):
+        return keywords
+    try:
+        return " ".join(keywords)
+    except Exception:
+        try:
+            return str(keywords)
+        except Exception:
+            return ""
+
+
+def _build_doc_text(
+    title: Optional[str],
+    abstract: Optional[str],
+    keywords: Optional[Union[str, Iterable[str]]],
+) -> str:
+    """Compose document text for embedding-based matching."""
+    return " ".join(filter(None, [title or "", abstract or "", _keywords_to_text(keywords)]))
+
+
+def _cosine_similarity_fn():
+    """Return a cosine-similarity function using numpy when available."""
+    try:
+        import numpy as _np
+
+        def _cos(a, b):
+            a = _np.asarray(a, dtype=float)
+            b = _np.asarray(b, dtype=float)
+            denom = _np.linalg.norm(a) * _np.linalg.norm(b)
+            return float(_np.dot(a, b) / denom) if denom else 0.0
+
+    except Exception:
+
+        def _cos(a, b):
+            sa = sum(x * x for x in a) ** 0.5
+            sb = sum(x * x for x in b) ** 0.5
+            if sa == 0 or sb == 0:
+                return 0.0
+            return sum(x * y for x, y in zip(a, b)) / (sa * sb)
+
+    return _cos
 
 
 def _phrase_present(text: str, phrase: str) -> bool:
@@ -335,15 +409,9 @@ class _Prox(_Node):
                     patL, patR, combined, self.n, directional=directional
                 ):
                     return True
-                # as a last resort, fall back to logical AND
-                try:
-                    return L.eval(
-                        title, abstract, kws, similarity_threshold=similarity_threshold
-                    ) and R.eval(
-                        title, abstract, kws, similarity_threshold=similarity_threshold
-                    )
-                except Exception:
-                    return False
+                # For atom-vs-atom proximity, do not degrade to logical AND.
+                # If terms are present but too far apart, this must remain False.
+                return False
             # for non-atom children, evaluate child if present
             try:
                 return self.left.eval(
@@ -358,6 +426,29 @@ class _Prox(_Node):
                 title, abstract, kws, similarity_threshold=similarity_threshold
             )
         return False
+
+
+def _make_predicate_from_ast(root: _Node) -> Callable:
+    """Build a callable predicate from a compiled AST root."""
+
+    def predicate(title, abstract, keywords, similarity_threshold=None):
+        if keywords is None:
+            kws = ""
+        elif isinstance(keywords, str):
+            kws = keywords
+        else:
+            kws = " ".join(keywords)
+        try:
+            return root.eval(
+                title or "",
+                abstract or "",
+                kws,
+                similarity_threshold=similarity_threshold,
+            )
+        except RecursionError:
+            return False
+
+    return predicate
 
 
 def compile_expression(expr: str, return_ast: bool = False):
@@ -453,29 +544,19 @@ def compile_expression(expr: str, return_ast: bool = False):
             pos = m[2]
             continue
         # field list like TITLE-ABS(
-        m = re.match(r"\s*([A-Z]+(?:-[A-Z]+)*)\s*\(", expr[pos:], flags=re.IGNORECASE)
+        m = _FIELD_LIST_PATTERN.match(expr[pos:])
         if m:
-            fields_raw = m.group(1).upper().split("-")
-            norm = []
-            for f in fields_raw:
-                if f in ("AUTHKEY", "KEY"):
-                    norm.append("KW")
-                else:
-                    norm.append(f)
-            fields = norm
+            fields = _normalize_fields(m.group(1))
             # find the absolute position of the opening paren
             paren_pos = pos + m.end() - 1
             end_pos = _find_matching_paren(paren_pos)
             if end_pos == -1:
                 raise ValueError("Unmatched parenthesis in FIELD(...) clause")
             inner = expr[paren_pos + 1 : end_pos].strip()
-            # strip surrounding quotes if present
-            if (inner.startswith('"') and inner.endswith('"')) or (
-                inner.startswith("'") and inner.endswith("'")
-            ):
-                phrase = inner[1:-1]
-            else:
-                phrase = inner
+            # Strip wrapping quotes only when the FIELD(...) content is a
+            # single quoted literal, not when it is a nested expression like
+            # "A" OR "B".
+            phrase = _unwrap_single_quoted_literal(inner)
             tokens.append(("FIELD_PHRASE", (fields, phrase)))
             pos = end_pos + 1
             continue
@@ -701,27 +782,9 @@ def compile_expression(expr: str, return_ast: bool = False):
 
     _iterative_check(root)
 
-    def predicate(title, abstract, keywords, similarity_threshold=None):
-        if keywords is None:
-            kws = ""
-        elif isinstance(keywords, str):
-            kws = keywords
-        else:
-            kws = " ".join(keywords)
-        try:
-            return root.eval(
-                title or "",
-                abstract or "",
-                kws,
-                similarity_threshold=similarity_threshold,
-            )
-        except RecursionError:
-            # defensively treat recursion as non-match
-            return False
-
     if return_ast:
         return root
-    return predicate
+    return _make_predicate_from_ast(root)
 
 
 def tokenize_expression(expr: str):
@@ -805,27 +868,15 @@ def tokenize_expression(expr: str):
             tokens.append((m[0], m[1]))
             pos = m[2]
             continue
-        m = re.match(r"\s*([A-Z]+(?:-[A-Z]+)*)\s*\(", expr[pos:], flags=re.IGNORECASE)
+        m = _FIELD_LIST_PATTERN.match(expr[pos:])
         if m:
-            fields_raw = m.group(1).upper().split("-")
-            norm = []
-            for f in fields_raw:
-                if f in ("AUTHKEY", "KEY"):
-                    norm.append("KW")
-                else:
-                    norm.append(f)
-            fields = norm
+            fields = _normalize_fields(m.group(1))
             paren_pos = pos + m.end() - 1
             end_pos = _find_matching_paren(paren_pos)
             if end_pos == -1:
                 raise ValueError("Unmatched parenthesis in FIELD(...) clause")
             inner = expr[paren_pos + 1 : end_pos].strip()
-            if (inner.startswith('"') and inner.endswith('"')) or (
-                inner.startswith("'") and inner.endswith("'")
-            ):
-                phrase = inner[1:-1]
-            else:
-                phrase = inner
+            phrase = _unwrap_single_quoted_literal(inner)
             tokens.append(("FIELD_PHRASE", (fields, phrase)))
             pos = end_pos + 1
             continue
@@ -899,6 +950,7 @@ class SDGClassifier:
         if not os.path.isdir(self.sdg_dir):
             raise RuntimeError(f"SDG queries directory not found: {self.sdg_dir}")
         self.predicates: List[Callable[[str, str, Union[str, Iterable[str]]], bool]] = []
+        self.ast_roots: Dict[int, Optional[_Node]] = {}
         self.phrases: Dict[int, List[str]] = {}
         self.fallback_sdgs: List[tuple] = []
         self.embedder = embedder
@@ -957,9 +1009,37 @@ class SDGClassifier:
                 phrases_set.add(a)
             for b in re.findall(r"'([^'\\]+)'", expr):
                 phrases_set.add(b)
+            # Normalize certain multi-word quoted phrases into explicit
+            # proximity expressions to avoid overly loose regex matches.
+            # Example: "sustainable* manag*" -> "sustainable* W/3 manag*"
+            # Filter out quoted operator-like tokens (e.g. " OR ") which
+            # originate from exported query text and are not real phrases.
+            op_pat = re.compile(r"^\s*(AND|OR|NOT|\(|\))\s*$", flags=re.IGNORECASE)
+            for p in list(phrases_set):
+                if op_pat.match(p):
+                    phrases_set.discard(p)
+            # Normalize whitespace in quoted phrases and discard
+            # operator-like quoted tokens. Keep multi-word wildcard
+            # phrases as-is — wildcard matching is restricted above
+            # so wildcards won't cross word boundaries.
+            for p in list(phrases_set):
+                if not p:
+                    phrases_set.discard(p)
+                    continue
+                if op_pat.match(p):
+                    phrases_set.discard(p)
+                    continue
+                # collapse internal whitespace in stored phrases
+                if re.search(r"\s+", p):
+                    norm = re.sub(r"\s+", " ", p).strip()
+                    if norm != p:
+                        phrases_set.discard(p)
+                        phrases_set.add(norm)
             self.phrases[i] = sorted(phrases_set)
             try:
-                self.predicates.append(compile_expression(expr))
+                root = compile_expression(expr, return_ast=True)
+                self.ast_roots[i] = root
+                self.predicates.append(_make_predicate_from_ast(root))
             except Exception:
                 def make_phrase_pred(phrases):
                     if not phrases:
@@ -981,6 +1061,7 @@ class SDGClassifier:
                     return pred
 
                 self.predicates.append(make_phrase_pred(phrases_set))
+                self.ast_roots[i] = None
                 self.fallback_sdgs.append((i, found))
                 continue
         if missing:
@@ -1048,112 +1129,6 @@ class SDGClassifier:
 
                 if self.auto_save_cache:
                     self.persist_cache()
-
-        # Persistence helpers for phrase index and FAISS indices
-        def _resolve_cache_paths(self):
-            if self.cache_dir and isinstance(self.cache_dir, str) and self.cache_dir.endswith('.pkl'):
-                phrase_file = self.cache_dir
-                faiss_dir = self.cache_faiss_dir or (os.path.dirname(phrase_file) if os.path.dirname(phrase_file) else None)
-            else:
-                base_cache = self.cache_dir or os.path.join(self.sdg_dir, "cache")
-                phrase_file = os.path.join(base_cache, "phrase_index.pkl")
-                faiss_dir = self.cache_faiss_dir or os.path.join(base_cache, "faiss")
-            return phrase_file, faiss_dir
-
-        def persist_cache(self):
-            """Persist the current phrase index and FAISS indices using the configured cache paths."""
-            phrase_file, faiss_dir = self._resolve_cache_paths()
-            saved_any = False
-            if phrase_file:
-                saved_any = self.save_phrase_index(phrase_file) or saved_any
-            if faiss_dir and self.use_faiss:
-                saved_any = self.save_faiss_indices(faiss_dir) or saved_any
-            return saved_any
-
-        def save_phrase_index(self, path: str):
-            """Save the computed phrase_index (including embeddings) to a pickle file."""
-            p = pathlib.Path(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                with open(p, "wb") as fh:
-                    pickle.dump({"phrase_index": self.phrase_index, "phrases": self.phrases}, fh, protocol=4)
-                return True
-            except Exception:
-                return False
-
-        def load_phrase_index(self, path: str):
-            """Load a previously saved phrase_index. Does not validate dimensions."""
-            p = pathlib.Path(path)
-            if not p.exists():
-                return False
-            try:
-                with open(p, "rb") as fh:
-                    data = pickle.load(fh)
-                self.phrase_index = data.get("phrase_index", {})
-                self.phrases = data.get("phrases", {})
-                # rebuild phrase_embeddings mapping from phrase_index
-                ph_embs = {}
-                for sdg, tuples in self.phrase_index.items():
-                    ph_embs[sdg] = [t[2] for t in tuples]
-                self.phrase_embeddings = ph_embs
-                return True
-            except Exception:
-                return False
-
-        def save_faiss_indices(self, dirpath: str):
-            """Persist any built FAISS indices to files under `dirpath`.
-
-            Files are written as: `{dirpath}/faiss_sdg{sdg}_len{L}.index`.
-            """
-            try:
-                import faiss
-            except Exception:
-                return False
-            p = pathlib.Path(dirpath)
-            p.mkdir(parents=True, exist_ok=True)
-            try:
-                wrote_any = False
-                for sdg, idx_map in (self.faiss_index or {}).items():
-                    for L, index in idx_map.items():
-                        if index is None:
-                            continue
-                        fname = p / f"faiss_sdg{sdg}_len{L}.index"
-                        try:
-                            faiss.write_index(index, str(fname))
-                            wrote_any = True
-                        except Exception:
-                            # ignore single failures
-                            continue
-                return wrote_any
-            except Exception:
-                return False
-
-        def load_faiss_indices(self, dirpath: str):
-            """Load FAISS indices from `dirpath` if present (reverse of save)."""
-            try:
-                import faiss
-            except Exception:
-                return False
-            p = pathlib.Path(dirpath)
-            if not p.exists():
-                return False
-            loaded = {}
-            for f in p.iterdir():
-                name = f.name
-                m = re.match(r"faiss_sdg(\d+)_len(\d+)\.index$", name)
-                if not m:
-                    continue
-                sdg = int(m.group(1))
-                L = int(m.group(2))
-                try:
-                    idx = faiss.read_index(str(f))
-                except Exception:
-                    idx = None
-                loaded.setdefault(sdg, {})[L] = idx
-            if loaded:
-                self.faiss_index = loaded
-                return True
-            return False
 
         # Persistence is explicit: call `save_phrase_index` / `save_faiss_indices`
         # to persist computed embeddings/indices. Automatic writing at init
@@ -1304,6 +1279,7 @@ class SDGClassifier:
             SDG1 and position 16 corresponds to SDG17.
         """
         results: List[int] = []
+        cosine = _cosine_similarity_fn()
 
         # prepare sliding windows for embed_ngram if requested
         doc_windows_by_len: Dict[int, List[str]] = {}
@@ -1315,11 +1291,7 @@ class SDGClassifier:
             and isinstance(self.phrase_embeddings, dict)
         ):
             try:
-                try:
-                    kws_txt = " ".join(keywords) if isinstance(keywords, (list, tuple)) else (keywords or "")
-                except Exception:
-                    kws_txt = str(keywords) if keywords else ""
-                doc_text = " ".join(filter(None, [title or "", abstract or "", kws_txt]))
+                doc_text = _build_doc_text(title, abstract, keywords)
             except Exception:
                 doc_text = ""
             if doc_text:
@@ -1365,33 +1337,17 @@ class SDGClassifier:
                 and isinstance(self.phrase_embeddings, dict)
             ):
                 try:
-                    doc_text = " ".join(filter(None, [title or "", abstract or "", (" ".join(keywords) if isinstance(keywords, (list, tuple)) else (keywords or ""))]))
+                    doc_text = _build_doc_text(title, abstract, keywords)
                 except Exception:
-                    doc_text = " ".join(filter(None, [title or "", abstract or "", str(keywords) if keywords else ""]))
+                    doc_text = ""
                 if doc_text:
                     try:
                         vecs = self.embedder([doc_text])
                         if vecs:
                             doc_vec = vecs[0]
-                            try:
-                                import numpy as _np
-
-                                def _cos(a, b):
-                                    a = _np.asarray(a, dtype=float)
-                                    b = _np.asarray(b, dtype=float)
-                                    denom = _np.linalg.norm(a) * _np.linalg.norm(b)
-                                    return float(_np.dot(a, b) / denom) if denom else 0.0
-                            except Exception:
-                                def _cos(a, b):
-                                    sa = sum(x * x for x in a) ** 0.5
-                                    sb = sum(x * x for x in b) ** 0.5
-                                    if sa == 0 or sb == 0:
-                                        return 0.0
-                                    return sum(x * y for x, y in zip(a, b)) / (sa * sb)
-
                             ph_embs = self.phrase_embeddings.get(sdg_index, [])
                             for pvec in ph_embs:
-                                if _cos(doc_vec, pvec) >= sdg_sim:
+                                if cosine(doc_vec, pvec) >= sdg_sim:
                                     hit = True
                                     break
                     except Exception:
@@ -1409,22 +1365,6 @@ class SDGClassifier:
                 phs = self.phrases.get(sdg_index, [])
                 ph_embs = self.phrase_embeddings.get(sdg_index, [])
                 if phs and ph_embs:
-                    try:
-                        import numpy as _np
-
-                        def _cos(a, b):
-                            a = _np.asarray(a, dtype=float)
-                            b = _np.asarray(b, dtype=float)
-                            denom = _np.linalg.norm(a) * _np.linalg.norm(b)
-                            return float(_np.dot(a, b) / denom) if denom else 0.0
-                    except Exception:
-                        def _cos(a, b):
-                            sa = sum(x * x for x in a) ** 0.5
-                            sb = sum(x * x for x in b) ** 0.5
-                            if sa == 0 or sb == 0:
-                                return 0.0
-                            return sum(x * y for x, y in zip(a, b)) / (sa * sb)
-
                     # use optimized phrase_index if available
                     tuples = self.phrase_index.get(sdg_index)
                     if tuples is None:
@@ -1476,7 +1416,7 @@ class SDGClassifier:
                                 window_embs_cache[L] = []
                         wembs = window_embs_cache.get(L, [])
                         for wvec in wembs:
-                            if _cos(pvec, wvec) >= sdg_sim:
+                            if cosine(pvec, wvec) >= sdg_sim:
                                 hit = True
                                 break
                         if hit:
@@ -1517,6 +1457,119 @@ class SDGClassifier:
                     hits.append(phrase)
             out[sdg_index] = hits
         return out
+
+    def debug_sdg_branches(
+        self,
+        sdg_index: int,
+        title: Optional[str],
+        abstract: Optional[str],
+        keywords: Optional[Union[str, Iterable[str]]],
+        similarity_threshold: Optional[Union[float, Dict[int, float]]] = None,
+        matched_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Inspect top-level branch matches and true atoms for one SDG.
+
+        Returns a dict with:
+        - sdg: SDG index (1..17)
+        - matched: whether any top-level branch matched
+        - matched_branch_indices: list of matched top-level branch indices
+        - branches: list of branch details with true atom phrases
+
+        When `matched_only=True`, only matched top-level branches are returned
+        under `branches`.
+        """
+        if not (1 <= sdg_index <= 17):
+            raise ValueError("sdg_index must be in 1..17")
+
+        root = self.ast_roots.get(sdg_index)
+        if root is None:
+            return {
+                "sdg": sdg_index,
+                "matched": False,
+                "matched_branch_indices": [],
+                "branches": [],
+                "note": "No AST available for this SDG (fallback parser was used).",
+            }
+
+        if keywords is None:
+            kws = ""
+        elif isinstance(keywords, str):
+            kws = keywords
+        else:
+            kws = " ".join(str(k) for k in keywords if k)
+
+        if isinstance(similarity_threshold, dict):
+            sdg_sim = similarity_threshold.get(sdg_index)
+        else:
+            sdg_sim = similarity_threshold
+
+        def _collect_atoms(node: _Node, out: List[_Atom]) -> None:
+            if isinstance(node, _Atom):
+                out.append(node)
+                return
+            if isinstance(node, (_And, _Or)):
+                _collect_atoms(node.left, out)
+                _collect_atoms(node.right, out)
+                return
+            if isinstance(node, (_AndList, _OrList)):
+                for c in node.children:
+                    _collect_atoms(c, out)
+                return
+            if isinstance(node, _Not):
+                _collect_atoms(node.child, out)
+                return
+            if isinstance(node, _Prox):
+                if node.left is not None:
+                    _collect_atoms(node.left, out)
+                if node.right is not None:
+                    _collect_atoms(node.right, out)
+                if node.child is not None:
+                    _collect_atoms(node.child, out)
+
+        top_children = root.children if isinstance(root, _OrList) else [root]
+        branches: List[Dict[str, Any]] = []
+        matched_idx: List[int] = []
+
+        for idx, branch in enumerate(top_children):
+            try:
+                branch_hit = bool(
+                    branch.eval(title or "", abstract or "", kws, similarity_threshold=sdg_sim)
+                )
+            except Exception:
+                branch_hit = False
+
+            atoms: List[_Atom] = []
+            _collect_atoms(branch, atoms)
+            true_atoms: List[str] = []
+            seen: set = set()
+            for a in atoms:
+                try:
+                    if a.eval(title or "", abstract or "", kws, similarity_threshold=sdg_sim):
+                        if a.phrase not in seen:
+                            true_atoms.append(a.phrase)
+                            seen.add(a.phrase)
+                except Exception:
+                    continue
+
+            if branch_hit:
+                matched_idx.append(idx)
+            if (not matched_only) or branch_hit:
+                branches.append(
+                    {
+                        "index": idx,
+                        "matched": branch_hit,
+                        "true_atoms": true_atoms,
+                        "true_atom_count": len(true_atoms),
+                        "atom_count": len(atoms),
+                    }
+                )
+
+        return {
+            "sdg": sdg_index,
+            "matched": bool(matched_idx),
+            "matched_branch_indices": matched_idx,
+            "branches": branches,
+        }
 
 # instantiate a default classifier for backward compatibility (loaded once)
 DEFAULT_CLASSIFIER = SDGClassifier(sdg_dir)
@@ -1595,6 +1648,28 @@ def matched_phrases_per_sdg(
     )
 
 
+def debug_sdg_branches(
+    sdg_index: int,
+    title: Optional[str],
+    abstract: Optional[str],
+    keywords: Optional[Union[str, Iterable[str]]],
+    similarity_threshold: Optional[Union[float, Dict[int, float]]] = None,
+    matched_only: bool = False,
+) -> Dict[str, Any]:
+    """Debug top-level branch matches and true atoms for one SDG.
+
+    Set `matched_only=True` to return only matched top-level branches.
+    """
+    return DEFAULT_CLASSIFIER.debug_sdg_branches(
+        sdg_index,
+        title,
+        abstract,
+        keywords,
+        similarity_threshold=similarity_threshold,
+        matched_only=matched_only,
+    )
+
+
 if __name__ == "__main__":
     import argparse
     import sys
@@ -1622,6 +1697,16 @@ if __name__ == "__main__":
         "--check-fallbacks",
         action="store_true",
         help="Show SDGs that used a simple quoted-phrase fallback at import",
+    )
+    parser.add_argument(
+        "--debug-sdg",
+        type=int,
+        help="Debug one SDG: print top-level matched branches and true atoms",
+    )
+    parser.add_argument(
+        "--debug-matched-only",
+        action="store_true",
+        help="With --debug-sdg, print only matched top-level branches",
     )
     args = parser.parse_args()
 
@@ -1670,6 +1755,17 @@ if __name__ == "__main__":
             print(f"SDG{i}: {len(ph)} extracted phrases")
             if ph:
                 print("  example:", ph[0])
+        sys.exit(0)
+
+    if args.debug_sdg is not None:
+        report = debug_sdg_branches(
+            args.debug_sdg,
+            args.title,
+            args.abstract,
+            args.keywords,
+            matched_only=args.debug_matched_only,
+        )
+        print(json.dumps(report, indent=2, ensure_ascii=False))
         sys.exit(0)
 
     if args.title or args.abstract or args.keywords:
