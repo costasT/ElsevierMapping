@@ -14,7 +14,7 @@ import json
 _pattern_cache: dict = {}
 
 _FIELD_LIST_PATTERN = re.compile(
-    r"\s*((?:TITLE|ABS|KW|AUTHKEY|KEY)(?:-(?:TITLE|ABS|KW|AUTHKEY|KEY))*)\s*\(",
+    r"\s*((?:TITLE|ABS|KW|AUTHKEY|KEY|SUBJAREA)(?:-(?:TITLE|ABS|KW|AUTHKEY|KEY|SUBJAREA))*)\s*\(",
     flags=re.IGNORECASE,
 )
 _SINGLE_QUOTED_LITERAL_PATTERN = re.compile(
@@ -28,6 +28,8 @@ def _normalize_fields(fields_raw: str) -> List[str]:
     for f in fields_raw.upper().split("-"):
         if f in ("AUTHKEY", "KEY"):
             fields.append("KW")
+        elif f == "SUBJAREA":
+            fields.append("SUBJAREA")
         else:
             fields.append(f)
     return fields
@@ -38,6 +40,42 @@ def _unwrap_single_quoted_literal(text: str) -> str:
     if _SINGLE_QUOTED_LITERAL_PATTERN.fullmatch(text):
         return text[1:-1]
     return text
+
+
+def _match_bare_phrase(expr: str, start: int) -> Optional[tuple[str, int]]:
+    """Match an unquoted phrase up to the next top-level operator or paren."""
+    length = len(expr)
+    pos = start
+    in_quote = None
+
+    while pos < length:
+        ch = expr[pos]
+        if in_quote:
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+            pos += 1
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            pos += 1
+            continue
+        if ch in "()":
+            break
+        op_match = re.match(r"\s*(AND|OR|NOT)\b", expr[pos:], flags=re.IGNORECASE)
+        if op_match:
+            break
+        prox_match = re.match(r"\s*([A-Z]+/[0-9]+)\b", expr[pos:], flags=re.IGNORECASE)
+        if prox_match:
+            break
+        pos += 1
+
+    phrase = expr[start:pos].strip()
+    if phrase:
+        return phrase, pos
+    return None
 
 
 def _normalize_similarity_text(value: Optional[str]) -> str:
@@ -136,6 +174,9 @@ def _match_in_field(
         return bool(pat.search(abstract or ""))
     if f == "KW":
         return bool(pat.search(kws or ""))
+    if f == "SUBJAREA":
+        text = _combined_article_text(title, abstract, kws).lower()
+        return phrase.lower() in text
     # Unknown field -> do not match
     return False
 
@@ -567,10 +608,11 @@ def compile_expression(expr: str, return_ast: bool = False):
             pos = m[2]
             continue
         # unquoted atom
-        m = re.match(r"\s*([^\s()]+)", expr[pos:])
+        m = _match_bare_phrase(expr, pos)
         if m:
-            tokens.append(("PHRASE", m.group(1)))
-            pos += m.end()
+            phrase, end_pos = m
+            tokens.append(("PHRASE", phrase))
+            pos = end_pos
             continue
         raise ValueError(f"Unable to tokenize at: {expr[pos:pos+20]!r}")
 
@@ -885,10 +927,11 @@ def tokenize_expression(expr: str):
             tokens.append((m[0], m[1]))
             pos = m[2]
             continue
-        m = re.match(r"\s*([^\s()]+)", expr[pos:])
+        m = _match_bare_phrase(expr, pos)
         if m:
-            tokens.append(("PHRASE", m.group(1)))
-            pos += m.end()
+            phrase, end_pos = m
+            tokens.append(("PHRASE", phrase))
+            pos = end_pos
             continue
         raise ValueError(f"Unable to tokenize at: {expr[pos:pos+20]!r}")
     return tokens
