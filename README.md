@@ -7,10 +7,10 @@ keywords) matches any of the 17 SDG mappings.
 
 Quick start
 
-1. Install test / formatting tools (optional):
+1. Install the project dependencies:
 
 ```bash
-python -m pip install pytest black
+python -m pip install -r requirements.txt
 ```
 
 2. Run the unit tests (recommended):
@@ -33,17 +33,7 @@ vec = classify_sdgs("Poverty reduction in rural areas", None, ["poverty"])
 print(vec[0])  # 1 if SDG1 matched else 0
 ```
 
-Would you like me to:
- - Add an example snippet to README that demonstrates `use_faiss=True` end-to-end (including model download).
- - Add a small benchmark script comparing FAISS vs. brute-force on synthetic data.
- - Persist phrase embeddings/index to disk (optional file-based cache) to avoid re-embedding at startup.
-
-I added:
-
-- A README example showing `use_faiss=True` and persistence APIs (`save_phrase_index`, `save_faiss_indices`, `load_phrase_index`, `load_faiss_indices`).
-- A simple benchmark script at `scripts/benchmark_faiss.py` that compares classification speed with and without FAISS using a synthetic embedder.
-
-Example persistence usage:
+Optional persistence usage:
 
 ```python
 from sdg_classifier import SDGClassifier
@@ -53,7 +43,7 @@ clf.save_phrase_index('data/phrases.pkl')
 clf.save_faiss_indices('data/faiss')
 
 # Later: load into a new classifier (without re-embedding)
-clf2 = SDGClassifier(sdg_dir_path='SDG 2023 Queries', embedder=None)
+clf2 = SDGClassifier(sdg_dir_path='SDG Queries', embedder=None)
 clf2.load_phrase_index('data/phrases.pkl')
 clf2.load_faiss_indices('data/faiss')
 ```
@@ -172,7 +162,7 @@ backwards compatibility.
 `SDGClassifier` parameters
 
 - `sdg_dir_path`: optional path to the directory that contains the SDG mapping
-	files. If omitted, the bundled `SDG 2023 Queries/` folder is used.
+	files. If omitted, the bundled `SDG Queries/` folder is used.
 - `embedder`: optional callable that takes a list of strings and returns a list
 	of embedding vectors. Use this if you already have an embedding model loaded
 	in memory.
@@ -223,7 +213,7 @@ The method returns a 17-element list of 0/1 flags, one per SDG.
 
 Data and mappings
 
-- Mapping files are stored in the `SDG 2023 Queries/` directory (SDG01.txt .. SDG17.txt).
+- Mapping files are stored in the `SDG Queries/` directory (SDG01.txt .. SDG17.txt).
 - During import the module compiles each SDG expression into a predicate. If
 	compilation fails for a mapping the loader previously fell back to a simple
 	quoted-phrase matcher; recent tokenizer/parser improvements aim to avoid
@@ -234,7 +224,8 @@ Tests and development
 - Tests live in the `tests/` folder and are run with `pytest`.
 - A small set of parser-feature unit tests exercise proximity, field-scoped
 	atoms, wildcard handling, and nested `FIELD(...)` inner expressions.
-- Use `black sdg_classifier.py` to format the main module.
+- Install any additional development tools you prefer locally; only runtime and
+	test dependencies are listed in `requirements.txt`.
 
 CLI
 
