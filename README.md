@@ -214,6 +214,8 @@ The method returns a 17-element list of 0/1 flags, one per SDG.
 Data and mappings
 
 - Mapping files are stored in the `SDG Queries/` directory (SDG01.txt .. SDG17.txt).
+	Currently, Elsevier 2025 Sustainable Development Goals (SDGs) Mapping are used
+	([link](https://elsevier.digitalcommonsdata.com/datasets/p52c7d3hfs/1)).
 - During import the module compiles each SDG expression into a predicate. If
 	compilation fails for a mapping the loader previously fell back to a simple
 	quoted-phrase matcher; recent tokenizer/parser improvements aim to avoid
