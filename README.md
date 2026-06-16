@@ -244,15 +244,3 @@ python -m sdg_classifier --list-sdgs
 # check which SDGs used a fallback at import
 python -m sdg_classifier --check-fallbacks
 ```
-
-Cleanup notes
-
-- Temporary debug helpers used during development have been removed. The test
-	suite now exercises the mapping compilation and predicate behavior for all
-	17 SDGs.
-
-Contact / next steps
-
-- If you want further improvements, common requests are: expanding proximity
-	semantics, supporting additional field names, or exporting compiled predicates
-	for faster use in production systems.
